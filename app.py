@@ -7,7 +7,7 @@ from groq import Groq
 st.set_page_config(page_title="SalesPro Analytics", layout="wide")
 
 # Вставьте сюда ваш ключ API
-GROQ_API_KEY = ""  #
+client = Groq(api_key=st.secrets["GROQ_API_KEY"]) #
 
 # --- ФУНКЦИИ ЗАГРУЗКИ ---
 @st.cache_data
@@ -157,3 +157,4 @@ if uploaded_file:
 
 else:
     st.info("👆 Пожалуйста, загрузите файл Excel в меню слева для начала работы.")
+
