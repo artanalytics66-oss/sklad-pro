@@ -1,162 +1,209 @@
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 import plotly.express as px
 from groq import Groq
+from io import BytesIO
 
-# --- НАСТРОЙКИ ---
-st.set_page_config(page_title="SalesPro Analytics", layout="wide")
+# --- НАСТРОЙКИ СТРАНИЦЫ (Широкий режим, Темная тема) ---
+st.set_page_config(page_title="Audit PRO", page_icon="⚡", layout="wide")
 
-# Вставьте сюда ваш ключ API
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-client = Groq(api_key=st.secrets["GROQ_API_KEY"]) #
+# --- CSS СТИЛИ (ДЕЛАЕМ КРАСИВО) ---
+st.markdown("""
+<style>
+    /* Основной фон */
+    .stApp {
+        background-color: #0E1117;
+        color: #FAFAFA;
+    }
+    /* Карточки метрик */
+    div[data-testid="stMetric"] {
+        background-color: #262730;
+        border-radius: 10px;
+        padding: 15px;
+        border: 1px solid #41444C;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.3);
+    }
+    /* Заголовки */
+    h1, h2, h3 {
+        font-family: 'Helvetica Neue', sans-serif;
+        font-weight: 700;
+        color: #FFFFFF;
+    }
+    /* Кнопки */
+    .stButton>button {
+        width: 100%;
+        border-radius: 8px;
+        font-weight: bold;
+    }
+    /* Сайдбар */
+    section[data-testid="stSidebar"] {
+        background-color: #161920;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# --- ФУНКЦИИ ЗАГРУЗКИ ---
-@st.cache_data
-def load_data(file):
-    """
-    Хитрая функция для чтения вашего специфического Excel-файла
-    с многоуровневой шапкой (Филиалы в ряд).
-    """
-    # Читаем без заголовков, чтобы разобрать структуру вручную
-    df = pd.read_excel(file, header=None)
+# --- АВТОРИЗАЦИЯ ---
+def check_password():
+    if st.session_state.get("password_correct", False): return True
     
-    # Строка 0 - Филиалы, Строка 1 - Каналы (Город, Область...), Строка 2+ - Данные
-    row0 = df.iloc[0].tolist()
-    row1 = df.iloc[1].tolist()
-    
-    branches = []
-    current_branch = "Unknown"
-    
-    # Заполняем пропуски в названиях филиалов (merged cells)
-    for item in row0:
-        if pd.notna(item) and "Филиал" in str(item):
-            current_branch = str(item).strip()
-        branches.append(current_branch)
+    # Красивая форма входа
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.markdown("<h1 style='text-align: center; color: #00CC96;'>🔐 SKLAD AUDIT PRO</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: gray;'>Введите ключ доступа для начала работы</p>", unsafe_allow_html=True)
+        password = st.text_input("License Key", type="password", label_visibility="collapsed")
         
-    cleaned_data = []
-    
-    # Проходим по строкам данных
-    for idx, row in df.iloc[2:].iterrows():
-        date_val = row[0]
-        if pd.isna(date_val): continue # Пропускаем пустые строки
-        
-        # Проходим по колонкам (начиная со 2-й, т.к. 0-Дата, 1-День)
-        for col_idx in range(2, len(row)):
-            branch = branches[col_idx]
-            channel = row1[col_idx]
-            val = row[col_idx]
-            
-            # Собираем только нужные метрики
-            if branch and channel in ['город', 'область', 'хорека']:
-                cleaned_data.append({
-                    'Дата': date_val,
-                    'Филиал': branch,
-                    'Канал': channel.capitalize(), # Делаем с большой буквы
-                    'Продажи': val if pd.notna(val) else 0
-                })
-                
-    return pd.DataFrame(cleaned_data)
+        if st.button("🚀 ВОЙТИ В СИСТЕМУ", type="primary"):
+            if password == "START-500": 
+                st.session_state["password_correct"] = True
+                st.rerun()
+            else:
+                st.error("❌ Неверный ключ")
+    return False
 
-def get_ai_advice(branch, plan, fact_df):
-    """Генерация промпта и запрос к AI"""
-    if not GROQ_API_KEY.startswith("gsk_"):
-        return "⚠️ Пожалуйста, укажите корректный API Key в коде."
-    
-    # Агрегация данных
-    total_fact = fact_df['Продажи'].sum()
-    structure = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
-    
-    prompt = f"""
-    Роль: Бизнес-аналитик. Объект: {branch}.
-    ДАННЫЕ:
-    - План: {plan:,.0f}
-    - Факт: {total_fact:,.0f} ({total_fact/plan*100:.1f}% выполнения)
-    - Структура: {structure}
-    
-    ЗАДАЧА:
-    Краткий отчет в Markdown:
-    1. Анализ выполнения (риски/успехи).
-    2. Худший канал продаж - почему?
-    3. 3 конкретных шага для выполнения плана.
-    """
-    
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        chat = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile"
-        )
-        return chat.choices[0].message.content
-    except Exception as e:
-        return f"Ошибка AI: {e}"
+if not check_password(): st.stop()
 
-# --- ИНТЕРФЕЙС ---
-st.title("📊 SalesPro Analytics Dashboard")
+# --- ПОДКЛЮЧЕНИЕ AI ---
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    client = Groq(api_key=GROQ_API_KEY)
+except:
+    st.warning("⚠️ AI-ключ не найден. Работает базовый режим.")
+    client = None
 
-# 1. Боковая панель
+# --- ГЛАВНОЕ МЕНЮ ---
+st.markdown("## ⚡ SKLAD AUDIT PRO <span style='font-size:16px; color:gray;'>v2.0</span>", unsafe_allow_html=True)
+
 with st.sidebar:
-    st.header("Настройки")
-    uploaded_file = st.file_uploader("Загрузить отчет (Excel)", type="xlsx")
+    st.markdown("### 📥 ПАНЕЛЬ УПРАВЛЕНИЯ")
+    uploaded_file = st.file_uploader("Загрузить отчет (.xlsx)", type=["xlsx"])
     
-    # Ручной ввод плана, т.к. в файле его нет
-    st.divider()
-    st.subheader("Планирование")
-    target_plan = st.number_input("План продаж на месяц (кг)", value=230000, step=1000)
-
-if uploaded_file:
-    # Загрузка и обработка
-    df = load_data(uploaded_file)
-    
-    # Фильтр по филиалам
-    all_branches = df['Филиал'].unique()
-    selected_branch = st.sidebar.selectbox("Выберите филиал", all_branches)
-    
-    # Фильтрация данных
-    df_branch = df[df['Филиал'] == selected_branch]
-    
-    # --- KPI БЛОК ---
-    fact_sales = df_branch['Продажи'].sum()
-    progress = (fact_sales / target_plan) * 100
-    avg_check = df_branch['Продажи'].mean() # Упрощенно
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("План на месяц", f"{target_plan:,.0f} кг")
-    col2.metric("Факт продаж", f"{fact_sales:,.0f} кг", f"{progress:.1f}%")
-    col3.metric("Прогноз (Линейный)", f"{fact_sales * 1.2:,.0f} кг") # Пример прогноза
-    col4.metric("Среднее в день", f"{fact_sales / 30:,.0f} кг") # Пример
-    
-    # --- ГРАФИКИ ---
-    st.divider()
-    c1, c2 = st.columns([2, 1])
-    
-    with c1:
-        st.subheader("Динамика продаж")
-        # Группировка по датам для графика
-        df_trend = df_branch.groupby('Дата')['Продажи'].sum().reset_index()
-        fig_trend = px.area(df_trend, x='Дата', y='Продажи', color_discrete_sequence=['#00CC96'])
-        fig_trend.update_layout(height=350, margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig_trend, use_container_width=True)
+    # Генератор шаблона
+    def get_template():
+        df = pd.DataFrame({
+            'Товарная Группа': ['Овощи', 'Пельмени', 'Молочка', 'Мясо', 'Рыба'],
+            'Начало_Кг': [10000, 5000, 2000, 8000, 1500],
+            'Приход_Кг': [15000, 2000, 3000, 8500, 1000],
+            'Продажи_Кг': [8000, 2100, 2900, 8000, 1200],
+            'Конец_Кг': [17000, 4900, 2100, 8500, 1300],
+            'Цена_Руб': [270, 350, 80, 450, 600]
+        })
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False)
+        return output.getvalue()
         
-    with c2:
-        st.subheader("Структура каналов")
-        df_pie = df_branch.groupby('Канал')['Продажи'].sum().reset_index()
-        fig_pie = px.pie(df_pie, values='Продажи', names='Канал', hole=0.4)
-        fig_pie.update_layout(height=350, margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    # --- AI БЛОК ---
+    st.download_button("📄 Скачать шаблон Excel", get_template(), "template.xlsx")
     st.divider()
-    if st.button("🧠 Запустить интеллектуальный аудит (AI)", type="primary"):
-        with st.spinner("Анализирую данные..."):
-            advice = get_ai_advice(selected_branch, target_plan, df_branch)
-            st.markdown("### Рекомендации AI")
-            st.markdown(advice)
+    if st.button("🚪 Выход из системы"):
+        st.session_state["password_correct"] = False
+        st.rerun()
 
-    # --- ДЕТАЛЬНАЯ ТАБЛИЦА ---
-    with st.expander("Посмотреть исходные данные"):
-        st.dataframe(df_branch, use_container_width=True)
+# --- ЛОГИКА ---
+if uploaded_file:
+    try:
+        df = pd.read_excel(uploaded_file)
+        
+        # Поиск цены
+        price_col = None
+        for col in df.columns:
+            if "цена" in str(col).lower() or "price" in str(col).lower():
+                price_col = col; break
+        if not price_col and len(df.columns) >= 6: price_col = df.columns[5]
+            
+        df_clean = df.iloc[:, [0, 1, 2, 3, 4]].copy()
+        df_clean['Цена_Руб'] = df[price_col]
+        df_clean.columns = ['Группа', 'Начало_Кг', 'Приход_Кг', 'Продажи_Кг', 'Конец_Кг', 'Цена_Руб']
+        df = df_clean
 
-else:
-    st.info("👆 Пожалуйста, загрузите файл Excel в меню слева для начала работы.")
+        # Расчеты
+        df['Остаток_Руб'] = df['Конец_Кг'] * df['Цена_Руб']
+        df['Индекс'] = df.apply(lambda x: x['Приход_Кг'] / x['Продажи_Кг'] if x['Продажи_Кг'] > 0 else 0, axis=1)
+        df['Запас_Дней'] = df.apply(lambda x: (x['Конец_Кг'] / x['Продажи_Кг'] * 30) if x['Продажи_Кг'] > 0 else 999, axis=1)
+        df['Движение'] = (df['Конец_Кг'] - df['Начало_Кг']) * df['Цена_Руб']
 
+        def get_status(row):
+            i, d = row['Индекс'], row['Запас_Дней']
+            if i > 1.2 and d > 45: return "🔴 СЛИВ"
+            if i < 0.8 and d < 10: return "🔴 ДЕФИЦИТ"
+            if i < 0.9 and d > 30: return "🟢 ВЫВОД"
+            return "🟢 БАЛАНС"
+        df['Статус'] = df.apply(get_status, axis=1)
 
+        # --- KPI ПАНЕЛЬ ---
+        st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        
+        total_money = df['Остаток_Руб'].sum()
+        frozen = df[df['Статус'].str.contains('🔴')]['Остаток_Руб'].sum()
+        cash_flow = df['Движение'].sum() * -1
+        
+        c1.metric("💰 Капитал склада", f"{total_money/1000000:.1f} млн ₽", f"{len(df)} групп")
+        c2.metric("🔥 Рисковые активы", f"{frozen/1000000:.1f} млн ₽", "Требуют внимания", delta_color="inverse")
+        c3.metric("💸 Денежный поток", f"{cash_flow/1000000:.1f} млн ₽", "За месяц")
+        
+        # Индикатор здоровья
+        health = 100 - (frozen / total_money * 100) if total_money > 0 else 0
+        c4.metric("❤️ Здоровье склада", f"{health:.0f}%", "Индекс эффективности")
+
+        # --- ГРАФИКИ ---
+        st.subheader("📊 Аналитика Эффективности")
+        
+        tab1, tab2 = st.tabs(["Карта Денег", "Матрица Рисков"])
+        
+        with tab1:
+            fig = px.bar(
+                df, x='Группа', y='Остаток_Руб', color='Статус',
+                color_discrete_map={'🔴 СЛИВ': '#FF4B4B', '🔴 ДЕФИЦИТ': '#FF8C00', '🟢 ВЫВОД': '#00CC96', '🟢 БАЛАНС': '#2E8B57'},
+                text_auto='.2s', title="Где лежат ваши деньги?"
+            )
+            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="white", height=500)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with tab2:
+            fig2 = px.scatter(
+                df, x='Запас_Дней', y='Индекс', size='Остаток_Руб', color='Статус',
+                hover_name='Группа', size_max=60,
+                color_discrete_map={'🔴 СЛИВ': '#FF4B4B', '🔴 ДЕФИЦИТ': '#FF8C00', '🟢 ВЫВОД': '#00CC96', '🟢 БАЛАНС': '#2E8B57'}
+            )
+            fig2.add_hline(y=1, line_dash="dash", line_color="gray")
+            fig2.add_vline(x=30, line_dash="dash", line_color="gray")
+            fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="white", height=500)
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # --- AI АУДИТ ---
+        st.subheader("🤖 AI-Аудитор")
+        
+        if st.button("🚀 Запустить полный анализ (AI)", type="primary"):
+            if client:
+                with st.spinner("Нейросеть анализирует данные..."):
+                    # Подготовка данных для AI
+                    report_data = df.to_csv(index=False)
+                    prompt = f"""
+                    Ты финансовый директор. Проанализируй этот складской отчет:
+                    {report_data}
+                    
+                    1. Найди 3 главные проблемы (где заморожены деньги).
+                    2. Посчитай, сколько денег можно высвободить.
+                    3. Дай жесткие рекомендации закупщикам.
+                    Пиши кратко, по делу, используй эмодзи.
+                    """
+                    
+                    completion = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.5
+                    )
+                    st.success("Анализ готов!")
+                    st.markdown(f"<div style='background-color: #262730; padding: 20px; border-radius: 10px;'>{completion.choices[0].message.content}</div>", unsafe_allow_html=True)
+            else:
+                st.error("AI не подключен. Проверьте ключ.")
+
+        # Таблица
+        with st.expander("📂 Исходные данные"):
+            st.dataframe(df, use_container_width=True)
+
+    except Exception as e: st.error(f"Ошибка: {e}")
+else: 
+    st.info("👈 Загрузите ваш файл Excel в меню слева")
