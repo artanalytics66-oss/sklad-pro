@@ -88,13 +88,16 @@ def load_data_and_plan(file):
                 channel = row1[col_idx]
                 val = row[col_idx]
                 
-                if branch and channel and str(channel).lower().strip() in ['город', 'область', 'хорека']:
-                    fact_data.append({
-                        'Дата': date_val,
-                        'Филиал': branch,
-                        'Канал': str(channel).strip().capitalize(),
-                        'Продажи': val if pd.notna(val) else 0
-                    })
+                # Исключаем служебные колонки типа "ИТОГО", все остальное берем в работу
+invalid_channels = ['итого', 'total', 'сумма']
+if branch and channel and str(channel).lower().strip() not in invalid_channels:
+     fact_data.append({
+        'Дата': date_val,
+        'Филиал': branch,
+        'Канал': str(channel).strip().capitalize(), # Теперь тут может быть "Кирпич" или "Услуги"
+        'Продажи': val if pd.notna(val) else 0
+    })
+
         df_sales = pd.DataFrame(fact_data)
 
         # --- ПЛАН ---
@@ -231,3 +234,4 @@ if uploaded_file:
         st.error("Ошибка формата данных. Скачайте образец слева.")
 else:
     st.info("👈 Загрузите файл Excel для начала работы.")
+
