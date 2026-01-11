@@ -36,44 +36,46 @@ if not check_auth():
 
 # --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-def calculate_forecast(df_branch):
+def calculate_forecast_metrics(df_branch):
     """
-    Рассчитывает прогноз на конец месяца: (Факт / Дней работы) * Дней в месяце
+    Рассчитывает метрики прогноза: дней работы, среднее в день, прогноз на месяц.
+    Возвращает словарь с метриками.
     """
+    metrics = {
+        "days_worked": 0,
+        "avg_daily": 0,
+        "forecast": 0,
+        "days_in_month": 30
+    }
+    
     if df_branch.empty:
-        return 0
+        return metrics
         
     try:
-        # Находим уникальные даты, когда были продажи
         dates = pd.to_datetime(df_branch['Дата'], errors='coerce').dropna().dt.date.unique()
-        days_worked = len(dates)
+        metrics["days_worked"] = len(dates)
         
-        if days_worked == 0:
-            return 0
+        if metrics["days_worked"] == 0:
+            return metrics
             
         current_fact = df_branch['Продажи'].sum()
-        avg_daily_sales = current_fact / days_worked
+        metrics["avg_daily"] = current_fact / metrics["days_worked"]
         
-        # Берем дату из первой записи, чтобы понять какой сейчас месяц
         first_date_val = df_branch['Дата'].iloc[0]
-        if pd.isna(first_date_val):
-            return current_fact 
-            
-        first_date = pd.to_datetime(first_date_val)
-        # Получаем количество дней в этом месяце (28, 30 или 31)
-        days_in_month = calendar.monthrange(first_date.year, first_date.month)[1]
+        if not pd.isna(first_date_val):
+            first_date = pd.to_datetime(first_date_val)
+            metrics["days_in_month"] = calendar.monthrange(first_date.year, first_date.month)[1]
         
-        forecast = avg_daily_sales * days_in_month
-        return forecast
-    except Exception as e:
-        return df_branch['Продажи'].sum()
+        metrics["forecast"] = metrics["avg_daily"] * metrics["days_in_month"]
+        return metrics
+    except Exception:
+        metrics["forecast"] = df_branch['Продажи'].sum()
+        return metrics
 
 def generate_template():
     """Создает Excel файл-образец с инструкцией"""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        
-        # ЛИСТ 1: ИНСТРУКЦИЯ
         workbook = writer.book
         worksheet = workbook.add_worksheet('Инструкция')
         
@@ -100,7 +102,7 @@ def generate_template():
         for line in rules:
             worksheet.write(row, 0, line, text_norm)
             row += 1
-            
+        
         worksheet.write(row, 0, 'Важно: Не удаляйте колонку "ИТОГО", она нужна для проверки планов.', text_red)
         worksheet.set_column('A:A', 70)
 
@@ -232,29 +234,62 @@ def get_ai_advice(branch, plan, fact_df):
     except:
         return "⚠️ ОШИБКА: Не настроен GROQ_API_KEY в Streamlit Secrets."
 
+    # --- СБОР ДАННЫХ ДЛЯ ПРОМПТА ---
     total_fact = fact_df['Продажи'].sum()
     percent = (total_fact / plan * 100) if plan > 0 else 0
     
-    # Новый точный прогноз для AI
-    forecast_val = calculate_forecast(fact_df)
+    # Метрики прогноза
+    metrics = calculate_forecast_metrics(fact_df)
+    forecast_val = metrics["forecast"]
+    avg_daily = metrics["avg_daily"]
+    days_passed = metrics["days_worked"]
     
-    # Конвертируем структуру в строку отдельно, чтобы не ломать f-string
-    structure_dict = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
-    structure_str = str(structure_dict)
+    # Структура продаж по каналам (Словарь: {Канал: Сумма})
+    fact_channels = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
     
+    # Подробная структура по дням (для секции ДЕТАЛИЗАЦИЯ)
+    # Превращаем DataFrame в список строк для промпта
+    # Пример: "2025-05-01: Кирпич=5000, Цемент=3000..."
+    details_list = []
+    daily_groups = fact_df.groupby(['Дата', 'Канал'])['Продажи'].sum().unstack(fill_value=0)
+    for date_idx, row in daily_groups.iterrows():
+        date_str = pd.to_datetime(date_idx).strftime('%Y-%m-%d')
+        # Собираем строку "Канал=Сумма" для всех каналов в этот день
+        channels_str = ", ".join([f"{col}={val:.0f}" for col, val in row.items()])
+        total_day = row.sum()
+        details_list.append(f"{date_str}: {channels_str}, Итого={total_day:.0f}")
+    
+    # Объединяем в один текстовый блок (ограничим 20 последними днями, чтобы не перегрузить AI)
+    details_text = "\n".join(details_list[-20:])
+    
+    # Строковое представление факта по каналам
+    fact_channels_str = str(fact_channels)
+
+    # --- НОВЫЙ ПРОМПТ НА ОСНОВЕ ВАШЕГО ФАЙЛА ---
     prompt = f"""
-    Роль: Старший бизнес-аналитик. Объект анализа: {branch}.
-    ВХОДНЫЕ ДАННЫЕ:
-    - План на месяц: {plan}
-    - Факт продаж: {total_fact} (Выполнение: {percent:.1f}%)
-    - Прогноз на конец месяца (расчетный): {forecast_val}
-    - Структура продаж: {structure_str}
+    Проанализируй данные по продажам для объекта: "{branch}".
     
-    ТВОЯ ЗАДАЧА:
-    Напиши отчет (Markdown).
-    1. Оценка ситуации (Сравните прогноз с планом).
-    2. Проблемная зона.
-    3. 3 конкретных совета.
+    ПЛАНОВЫЕ ПОКАЗАТЕЛИ (мес):
+    - Общий план: {plan:,.0f}
+    
+    ФАКТИЧЕСКИЕ ПОКАЗАТЕЛИ (за {days_passed} дней продаж):
+    - Общий факт: {total_fact:,.0f} ({percent:.1f}% от плана).
+    - Факт по каналам/категориям: {fact_channels_str}
+    
+    ДИНАМИКА:
+    - Среднесуточные продажи: {avg_daily:,.0f}
+    - Прогноз выполнения на конец месяца: {forecast_val:,.0f}
+    
+    ПОДРОБНАЯ СТРУКТУРА ПРОДАЖ (последние дни):
+    {details_text}
+    
+    ЗАДАЧА:
+    Подготовь краткий профессиональный отчет в строгом деловом стиле (Markdown).
+    1. Общая оценка текущего темпа (сравнение прогноза и плана).
+    2. Анализ по каналам: какая категория демонстрирует наибольшее отставание или провал.
+    3. Анализ динамики: есть ли заметные спады в конкретные дни.
+    4. Точный прогноз: будет ли выполнен план при сохранении темпа.
+    5. Конкретные рекомендации для руководителя объекта.
     """
     
     try:
@@ -276,68 +311,4 @@ with st.sidebar:
     st.download_button(
         label="📥 Скачать шаблон с инструкцией",
         data=template_file,
-        file_name="sales_template_universal.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    st.divider()
-    uploaded_file = st.file_uploader("Загрузить отчет (.xlsx)", type="xlsx")
-
-if uploaded_file:
-    df, plans_map = load_data_and_plan(uploaded_file)
-    
-    if df is not None and not df.empty:
-        all_branches = sorted(df['Филиал'].unique())
-        selected_branch = st.sidebar.selectbox("Выберите объект/филиал", all_branches)
-        
-        df_branch = df[df['Филиал'] == selected_branch]
-        auto_plan = plans_map.get(selected_branch, 0)
-        
-        if auto_plan == 0:
-            st.warning(f"План не найден в файле. Введите вручную.")
-            target_plan = st.sidebar.number_input("План продаж", value=200000)
-        else:
-            st.sidebar.success(f"План подгружен: {auto_plan:,.0f}")
-            target_plan = auto_plan
-            
-        fact = df_branch['Продажи'].sum()
-        delta = fact - target_plan
-        percent = (fact / target_plan) * 100 if target_plan > 0 else 0
-        
-        # ИСПРАВЛЕННЫЙ РАСЧЕТ ПРОГНОЗА
-        forecast_val = calculate_forecast(df_branch)
-        forecast_delta = forecast_val - target_plan
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("🎯 План", f"{target_plan:,.0f}")
-        col2.metric("💰 Факт", f"{fact:,.0f}", f"{percent:.1f}%")
-        col3.metric("📉 Отклонение", f"{delta:,.0f}", delta_color="normal")
-        
-        col4.metric(
-            "🔮 Прогноз (конец мес.)", 
-            f"{forecast_val:,.0f}", 
-            f"{forecast_delta:,.0f}", 
-            delta_color="normal"
-        )
-
-        st.divider()
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.subheader("📆 Динамика")
-            df_trend = df_branch.groupby('Дата')['Продажи'].sum().reset_index()
-            fig_trend = px.area(df_trend, x='Дата', y='Продажи', color_discrete_sequence=['#00CC96'])
-            st.plotly_chart(fig_trend, use_container_width=True)
-        with c2:
-            st.subheader("📊 Категории")
-            df_pie = df_branch.groupby('Канал')['Продажи'].sum().reset_index()
-            fig_pie = px.pie(df_pie, values='Продажи', names='Канал', hole=0.5)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        st.divider()
-        if st.button("🧠 AI Бизнес-Ассистент", type="primary", use_container_width=True):
-            with st.spinner("Анализ данных..."):
-                report = get_ai_advice(selected_branch, target_plan, df_branch)
-                st.markdown(report)
-    else:
-        st.error("Ошибка формата. Скачайте шаблон слева.")
-else:
-    st.info("👈 Начните работу с загрузки файла.")
+        file_name="sales_template_universal.xl
