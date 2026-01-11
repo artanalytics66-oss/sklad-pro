@@ -32,13 +32,49 @@ def check_auth():
 if not check_auth():
     st.stop()
 
-# --- 2. ГЕНЕРАЦИЯ УНИВЕРСАЛЬНОГО ШАБЛОНА ---
+# --- 2. ГЕНЕРАЦИЯ УНИВЕРСАЛЬНОГО ШАБЛОНА С ИНСТРУКЦИЕЙ ---
 def generate_template():
-    """Создает Excel файл-образец в памяти"""
+    """Создает Excel файл-образец с инструкцией"""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        # Лист ФАКТ
-        # Пример для строителя: Магазин 1 (Кирпич, Цемент, Краска)
+        
+        # --- ЛИСТ 1: ИНСТРУКЦИЯ ---
+        workbook = writer.book
+        worksheet = workbook.add_worksheet('Инструкция')
+        
+        # Форматы
+        bold_head = workbook.add_format({'bold': True, 'font_size': 14, 'color': '#2c3e50'})
+        text_norm = workbook.add_format({'font_size': 12, 'text_wrap': True, 'valign': 'top'})
+        text_red = workbook.add_format({'bold': True, 'color': 'red', 'font_size': 12})
+        
+        # Заголовок
+        worksheet.write('A1', 'Как заполнить шаблон под свой бизнес:', bold_head)
+        
+        # Правила
+        rules = [
+            "",
+            "1. В верхней строке (в листах 'Факт' и 'План') пишите названия ваших точек.",
+            "   (Например: Магазины, Склады, Офисы, Филиалы).",
+            "",
+            "2. Под каждым названием точки есть колонки категорий.",
+            "   Вы можете переименовать их как хотите.",
+            "   (Например: Товары, Услуги, Доставка или Опт, Розница, Интернет).",
+            "",
+            "3. Вы можете добавлять новые колонки или удалять лишние.",
+            ""
+        ]
+        
+        row = 1
+        for line in rules:
+            worksheet.write(row, 0, line, text_norm)
+            row += 1
+            
+        # Важное примечание
+        worksheet.write(row, 0, 'Важно: Не удаляйте колонку "ИТОГО", она нужна для проверки планов.', text_red)
+        
+        worksheet.set_column('A:A', 70) # Ширина колонки
+
+        # --- ЛИСТ 2: ФАКТ ---
         df_fact = pd.DataFrame([
             ["Дата", "Магазин Центр", "", "", "Магазин Склад", "", ""],
             ["", "Кирпич", "Цемент", "Краска", "Кирпич", "Цемент", "Краска"],
@@ -47,7 +83,7 @@ def generate_template():
         ])
         df_fact.to_excel(writer, sheet_name='Факт', index=False, header=False)
         
-        # Лист ПЛАН
+        # --- ЛИСТ 3: ПЛАН ---
         df_plan = pd.DataFrame([
             ["Месяц", "Год", "Магазин Центр", "", "", "", "Магазин Склад", "", "", ""],
             ["", "", "Кирпич", "Цемент", "Краска", "ИТОГО", "Кирпич", "Цемент", "Краска", "ИТОГО"],
@@ -63,46 +99,64 @@ def generate_template():
 def load_data_and_plan(file):
     try:
         xl = pd.ExcelFile(file)
+        sheet_names = xl.sheet_names
         
-        # --- ФАКТ ---
-        # Берем первый лист как факт
-        fact_sheet = xl.sheet_names[0]
+        # 1. Поиск листа с ФАКТОМ (исключаем инструкцию и план)
+        fact_sheet = None
+        
+        # Сначала ищем по названию
+        for s in sheet_names:
+            if 'факт' in s.lower() or 'fact' in s.lower():
+                fact_sheet = s
+                break
+        
+        # Если не нашли, берем первый подходящий, который не инструкция и не план
+        if not fact_sheet:
+            for s in sheet_names:
+                name_lower = s.lower()
+                if "инструкция" not in name_lower and "instruction" not in name_lower and "план" not in name_lower and "plan" not in name_lower:
+                    fact_sheet = s
+                    break
+        
+        # Если совсем ничего не нашли, пробуем второй лист (индекс 1), т.к. первый - инструкция
+        if not fact_sheet and len(sheet_names) > 1:
+            fact_sheet = sheet_names[1]
+            
+        if not fact_sheet:
+            return None, {} # Нечего читать
+
+        # Читаем ФАКТ
         df_fact_raw = pd.read_excel(file, sheet_name=fact_sheet, header=None)
         
-        row0 = df_fact_raw.iloc[0].tolist() # Верхняя строка (Филиалы)
-        row1 = df_fact_raw.iloc[1].tolist() # Вторая строка (Каналы/Категории)
+        row0 = df_fact_raw.iloc[0].tolist() # Филиалы
+        row1 = df_fact_raw.iloc[1].tolist() # Каналы
         
         branches = []
         curr = "Unknown"
-        # Заполняем пропуски в названиях филиалов (merged cells logic)
         for item in row0:
             if pd.notna(item) and str(item).strip() != "":
-                # Считаем филиалом всё, что не Дата/День
                 if "дата" not in str(item).lower():
                     curr = str(item).strip()
             branches.append(curr)
             
         fact_data = []
-        # Данные идут с 3-й строки (индекс 2)
         for idx, row in df_fact_raw.iloc[2:].iterrows():
             date_val = row[0]
             if pd.isna(date_val): continue
             
-            # Сканируем колонки. Обычно данные начинаются со 2-й или 3-й колонки
-            start_col = 1 
+            # Сканируем данные
+            start_col = 1
             for col_idx in range(start_col, len(row)):
                 if col_idx >= len(branches): break
                 branch = branches[col_idx]
-                
                 if col_idx >= len(row1): break
                 channel = row1[col_idx]
                 val = row[col_idx]
                 
-                # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ: УНИВЕРСАЛЬНЫЙ ФИЛЬТР ---
-                # Игнорируем служебные слова, всё остальное берем как категорию
+                # Универсальный фильтр (исключаем служебные слова)
                 invalid_words = ['итого', 'total', 'сумма', 'nan', 'none', 'дата', 'день']
-                
                 channel_str = str(channel).strip()
+                
                 if (branch != "Unknown" 
                     and channel_str 
                     and channel_str.lower() not in invalid_words 
@@ -110,28 +164,24 @@ def load_data_and_plan(file):
                     
                     fact_data.append({
                         'Дата': date_val,
-                        'Филиал': branch, # Это может быть "Магазин 1"
-                        'Канал': channel_str.capitalize(), # Это может быть "Кирпич"
+                        'Филиал': branch,
+                        'Канал': channel_str.capitalize(),
                         'Продажи': val if pd.notna(val) else 0
                     })
-                    
         df_sales = pd.DataFrame(fact_data)
 
-        # --- ПЛАН ---
+        # 2. Поиск листа с ПЛАНОМ
         plans_map = {}
-        # Ищем лист, где есть 'план' или 'plan'
-        plan_sheet_name = next((s for s in xl.sheet_names if 'план' in s.lower() or 'plan' in s.lower()), None)
+        plan_sheet_name = next((s for s in sheet_names if 'план' in s.lower() or 'plan' in s.lower()), None)
         
         if plan_sheet_name:
             df_plan_raw = pd.read_excel(file, sheet_name=plan_sheet_name, header=None)
             p_row0 = df_plan_raw.iloc[0].tolist()
             p_row1 = df_plan_raw.iloc[1].tolist()
-            p_values = df_plan_raw.iloc[2].tolist() # Берем первую строку значений плана
+            p_values = df_plan_raw.iloc[2].tolist()
             
             p_branches = []
             p_curr = "Unknown"
-            
-            # Логика заголовков для плана
             for i in range(len(p_row0)):
                 item = p_row0[i]
                 if pd.notna(item) and str(item).strip() != "":
@@ -144,7 +194,6 @@ def load_data_and_plan(file):
                 branch = p_branches[i]
                 channel = p_row1[i]
                 
-                # Ищем колонку "ИТОГО" для каждого филиала
                 if (pd.notna(val) 
                     and branch != "Unknown"
                     and str(channel).lower().strip() in ['итого', 'total', 'сумма']):
@@ -153,7 +202,6 @@ def load_data_and_plan(file):
         return df_sales, plans_map
 
     except Exception as e:
-        # Для отладки можно раскомментировать print(e)
         return None, {}
 
 def get_ai_advice(branch, plan, fact_df):
@@ -163,112 +211,4 @@ def get_ai_advice(branch, plan, fact_df):
         return "⚠️ ОШИБКА: Не настроен GROQ_API_KEY в Streamlit Secrets."
 
     total_fact = fact_df['Продажи'].sum()
-    percent = (total_fact / plan * 100) if plan > 0 else 0
-    structure = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
-    
-    prompt = f"""
-    Роль: Старший бизнес-аналитик. Объект анализа: {branch}.
-    ВХОДНЫЕ ДАННЫЕ:
-    - План на месяц: {plan:,.0f}
-    - Факт продаж: {total_fact:,.0f} (Выполнение: {percent:.1f}%)
-    - Структура продаж по категориям: {structure}
-    
-    ТВОЯ ЗАДАЧА:
-    Напиши стратегический отчет в формате Markdown.
-    1. 🎯 Статус выполнения (Опасно/Норма/Отлично).
-    2. 📉 Проблемная зона (какая категория товаров/услуг отстает).
-    3. 🚀 3 конкретных действия для менеджера этого объекта, чтобы закрыть план.
-    Будь краток, профессионален и конкретен.
-    """
-    
-    try:
-        client = Groq(api_key=api_key)
-        chat = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile" 
-        )
-        return chat.choices[0].message.content
-    except Exception as e:
-        return f"Ошибка AI сервиса: {e}"
-
-# --- 4. ГЛАВНЫЙ ЭКРАН ---
-st.title("📊 SalesPro Analytics Dashboard")
-
-with st.sidebar:
-    st.header("Управление")
-    
-    # Кнопка скачивания шаблона
-    template_file = generate_template()
-    st.download_button(
-        label="📥 Скачать универсальный образец",
-        data=template_file,
-        file_name="sales_template_universal.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    
-    st.divider()
-    uploaded_file = st.file_uploader("Загрузить отчет (.xlsx)", type="xlsx")
-
-if uploaded_file:
-    df, plans_map = load_data_and_plan(uploaded_file)
-    
-    if df is not None and not df.empty:
-        # Сортируем филиалы для удобства
-        all_branches = sorted(df['Филиал'].unique())
-        
-        # Если филиалов много, selectbox удобен
-        selected_branch = st.sidebar.selectbox("Выберите объект/филиал", all_branches)
-        
-        df_branch = df[df['Филиал'] == selected_branch]
-        auto_plan = plans_map.get(selected_branch, 0)
-        
-        if auto_plan == 0:
-            st.warning(f"План не найден в файле. Введите вручную.")
-            target_plan = st.sidebar.number_input("План продаж", value=200000)
-        else:
-            st.sidebar.success(f"План подгружен из файла: {auto_plan:,.0f}")
-            target_plan = auto_plan
-            
-        fact = df_branch['Продажи'].sum()
-        delta = fact - target_plan
-        percent = (fact / target_plan) * 100 if target_plan > 0 else 0
-        
-        # Метрики
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("🎯 План", f"{target_plan:,.0f}")
-        col2.metric("💰 Факт", f"{fact:,.0f}", f"{percent:.1f}%")
-        col3.metric("📉 Отклонение", f"{delta:,.0f}", delta_color="normal")
-        # Прогноз делаем простым линейным (на 25% больше факта, как пример)
-        col4.metric("🔮 Прогноз", f"{fact * 1.25:,.0f}")
-
-        st.divider()
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            st.subheader("📆 Динамика по дням")
-            df_trend = df_branch.groupby('Дата')['Продажи'].sum().reset_index()
-            # График области выглядит солиднее
-            fig_trend = px.area(df_trend, x='Дата', y='Продажи', color_discrete_sequence=['#00CC96'])
-            st.plotly_chart(fig_trend, use_container_width=True)
-            
-        with c2:
-            st.subheader("📊 Структура (Категории)")
-            df_pie = df_branch.groupby('Канал')['Продажи'].sum().reset_index()
-            # Бублик (hole=0.5) выглядит современнее пирога
-            fig_pie = px.pie(df_pie, values='Продажи', names='Канал', hole=0.5)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        st.divider()
-        st.subheader("🧠 AI Бизнес-Ассистент")
-        if st.button("Запросить анализ стратегии", type="primary", use_container_width=True):
-            with st.spinner("Анализирую данные и формирую рекомендации..."):
-                report = get_ai_advice(selected_branch, target_plan, df_branch)
-                st.markdown(report)
-                
-        # Для отладки (показать таблицу данных под графиками)
-        with st.expander("Посмотреть исходные данные таблицы"):
-            st.dataframe(df_branch, use_container_width=True)
-
-    else:
-        st.error("Не удалось распознать данные. Убедитесь, что вы загрузили правильный Excel файл (скачайте образец слева).")
-else:
-    st.info("👈 Загрузите ваш Excel файл в меню слева для начала работы.")
+    percent = (total_fact / plan * 100) if plan > 0 el
