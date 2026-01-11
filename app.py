@@ -4,6 +4,8 @@ import plotly.express as px
 from groq import Groq
 import io
 import xlsxwriter
+from datetime import datetime
+import calendar
 
 # --- КОНФИГУРАЦИЯ ---
 st.set_page_config(page_title="SalesPro Analytics", layout="wide")
@@ -32,25 +34,56 @@ def check_auth():
 if not check_auth():
     st.stop()
 
-# --- 2. ГЕНЕРАЦИЯ УНИВЕРСАЛЬНОГО ШАБЛОНА С ИНСТРУКЦИЕЙ ---
+# --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def calculate_forecast(df_branch):
+    """
+    Рассчитывает прогноз на конец месяца: (Факт / Дней работы) * Дней в месяце
+    """
+    if df_branch.empty:
+        return 0
+        
+    try:
+        # Находим уникальные даты, когда были продажи
+        dates = pd.to_datetime(df_branch['Дата'], errors='coerce').dropna().dt.date.unique()
+        days_worked = len(dates)
+        
+        if days_worked == 0:
+            return 0
+            
+        current_fact = df_branch['Продажи'].sum()
+        avg_daily_sales = current_fact / days_worked
+        
+        # Берем дату из первой записи, чтобы понять какой сейчас месяц
+        first_date_val = df_branch['Дата'].iloc[0]
+        if pd.isna(first_date_val):
+            return current_fact # Если даты битые, возвращаем просто факт
+            
+        first_date = pd.to_datetime(first_date_val)
+        # Получаем количество дней в этом месяце (28, 30 или 31)
+        days_in_month = calendar.monthrange(first_date.year, first_date.month)[1]
+        
+        forecast = avg_daily_sales * days_in_month
+        return forecast
+    except Exception as e:
+        # Если что-то пошло не так, возвращаем просто факт x 1 (пессимистично)
+        return df_branch['Продажи'].sum()
+
 def generate_template():
     """Создает Excel файл-образец с инструкцией"""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
         
-        # --- ЛИСТ 1: ИНСТРУКЦИЯ ---
+        # ЛИСТ 1: ИНСТРУКЦИЯ
         workbook = writer.book
         worksheet = workbook.add_worksheet('Инструкция')
         
-        # Форматы
         bold_head = workbook.add_format({'bold': True, 'font_size': 14, 'color': '#2c3e50'})
         text_norm = workbook.add_format({'font_size': 12, 'text_wrap': True, 'valign': 'top'})
         text_red = workbook.add_format({'bold': True, 'color': 'red', 'font_size': 12})
         
-        # Заголовок
         worksheet.write('A1', 'Как заполнить шаблон под свой бизнес:', bold_head)
         
-        # Правила
         rules = [
             "",
             "1. В верхней строке (в листах 'Факт' и 'План') пишите названия ваших точек.",
@@ -69,12 +102,10 @@ def generate_template():
             worksheet.write(row, 0, line, text_norm)
             row += 1
             
-        # Важное примечание
         worksheet.write(row, 0, 'Важно: Не удаляйте колонку "ИТОГО", она нужна для проверки планов.', text_red)
-        
-        worksheet.set_column('A:A', 70) # Ширина колонки
+        worksheet.set_column('A:A', 70)
 
-        # --- ЛИСТ 2: ФАКТ ---
+        # ЛИСТ 2: ФАКТ
         df_fact = pd.DataFrame([
             ["Дата", "Магазин Центр", "", "", "Магазин Склад", "", ""],
             ["", "Кирпич", "Цемент", "Краска", "Кирпич", "Цемент", "Краска"],
@@ -83,7 +114,7 @@ def generate_template():
         ])
         df_fact.to_excel(writer, sheet_name='Факт', index=False, header=False)
         
-        # --- ЛИСТ 3: ПЛАН ---
+        # ЛИСТ 3: ПЛАН
         df_plan = pd.DataFrame([
             ["Месяц", "Год", "Магазин Центр", "", "", "", "Магазин Склад", "", "", ""],
             ["", "", "Кирпич", "Цемент", "Краска", "ИТОГО", "Кирпич", "Цемент", "Краска", "ИТОГО"],
@@ -94,42 +125,36 @@ def generate_template():
     buffer.seek(0)
     return buffer
 
-# --- 3. УНИВЕРСАЛЬНАЯ ОБРАБОТКА ДАННЫХ ---
+# --- 3. ЗАГРУЗКА ДАННЫХ ---
 @st.cache_data
 def load_data_and_plan(file):
     try:
         xl = pd.ExcelFile(file)
         sheet_names = xl.sheet_names
         
-        # 1. Поиск листа с ФАКТОМ (исключаем инструкцию и план)
+        # Ищем лист ФАКТ (исключаем инструкцию и план)
         fact_sheet = None
-        
-        # Сначала ищем по названию
         for s in sheet_names:
             if 'факт' in s.lower() or 'fact' in s.lower():
                 fact_sheet = s
                 break
-        
-        # Если не нашли, берем первый подходящий, который не инструкция и не план
         if not fact_sheet:
             for s in sheet_names:
                 name_lower = s.lower()
                 if "инструкция" not in name_lower and "instruction" not in name_lower and "план" not in name_lower and "plan" not in name_lower:
                     fact_sheet = s
                     break
-        
-        # Если совсем ничего не нашли, пробуем второй лист (индекс 1), т.к. первый - инструкция
         if not fact_sheet and len(sheet_names) > 1:
             fact_sheet = sheet_names[1]
             
         if not fact_sheet:
-            return None, {} # Нечего читать
+            return None, {}
 
         # Читаем ФАКТ
         df_fact_raw = pd.read_excel(file, sheet_name=fact_sheet, header=None)
         
-        row0 = df_fact_raw.iloc[0].tolist() # Филиалы
-        row1 = df_fact_raw.iloc[1].tolist() # Каналы
+        row0 = df_fact_raw.iloc[0].tolist()
+        row1 = df_fact_raw.iloc[1].tolist()
         
         branches = []
         curr = "Unknown"
@@ -144,7 +169,6 @@ def load_data_and_plan(file):
             date_val = row[0]
             if pd.isna(date_val): continue
             
-            # Сканируем данные
             start_col = 1
             for col_idx in range(start_col, len(row)):
                 if col_idx >= len(branches): break
@@ -153,7 +177,6 @@ def load_data_and_plan(file):
                 channel = row1[col_idx]
                 val = row[col_idx]
                 
-                # Универсальный фильтр (исключаем служебные слова)
                 invalid_words = ['итого', 'total', 'сумма', 'nan', 'none', 'дата', 'день']
                 channel_str = str(channel).strip()
                 
@@ -170,7 +193,7 @@ def load_data_and_plan(file):
                     })
         df_sales = pd.DataFrame(fact_data)
 
-        # 2. Поиск листа с ПЛАНОМ
+        # Читаем ПЛАН
         plans_map = {}
         plan_sheet_name = next((s for s in sheet_names if 'план' in s.lower() or 'plan' in s.lower()), None)
         
@@ -211,4 +234,22 @@ def get_ai_advice(branch, plan, fact_df):
         return "⚠️ ОШИБКА: Не настроен GROQ_API_KEY в Streamlit Secrets."
 
     total_fact = fact_df['Продажи'].sum()
-    percent = (total_fact / plan * 100) if plan > 0 el
+    percent = (total_fact / plan * 100) if plan > 0 else 0
+    
+    # Новый точный прогноз для AI
+    forecast_val = calculate_forecast(fact_df)
+    
+    structure = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
+    
+    prompt = f"""
+    Роль: Старший бизнес-аналитик. Объект анализа: {branch}.
+    ВХОДНЫЕ ДАННЫЕ:
+    - План на месяц: {plan:,.0f}
+    - Факт продаж: {total_fact:,.0f} (Выполнение: {percent:.1f}%)
+    - Прогноз на конец месяца (расчетный): {forecast_val:,.0f}
+    - Структура продаж: {structure}
+    
+    ТВОЯ ЗАДАЧА:
+    Напиши отчет (Markdown).
+    1. Оценка ситуации (Сравните прогноз с планом).
+    2. Проблемная з
