@@ -57,7 +57,7 @@ def calculate_forecast(df_branch):
         # Берем дату из первой записи, чтобы понять какой сейчас месяц
         first_date_val = df_branch['Дата'].iloc[0]
         if pd.isna(first_date_val):
-            return current_fact # Если даты битые, возвращаем просто факт
+            return current_fact 
             
         first_date = pd.to_datetime(first_date_val)
         # Получаем количество дней в этом месяце (28, 30 или 31)
@@ -66,7 +66,6 @@ def calculate_forecast(df_branch):
         forecast = avg_daily_sales * days_in_month
         return forecast
     except Exception as e:
-        # Если что-то пошло не так, возвращаем просто факт x 1 (пессимистично)
         return df_branch['Продажи'].sum()
 
 def generate_template():
@@ -132,7 +131,7 @@ def load_data_and_plan(file):
         xl = pd.ExcelFile(file)
         sheet_names = xl.sheet_names
         
-        # Ищем лист ФАКТ (исключаем инструкцию и план)
+        # Ищем лист ФАКТ
         fact_sheet = None
         for s in sheet_names:
             if 'факт' in s.lower() or 'fact' in s.lower():
@@ -239,17 +238,106 @@ def get_ai_advice(branch, plan, fact_df):
     # Новый точный прогноз для AI
     forecast_val = calculate_forecast(fact_df)
     
-    structure = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
+    # Конвертируем структуру в строку отдельно, чтобы не ломать f-string
+    structure_dict = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
+    structure_str = str(structure_dict)
     
     prompt = f"""
     Роль: Старший бизнес-аналитик. Объект анализа: {branch}.
     ВХОДНЫЕ ДАННЫЕ:
-    - План на месяц: {plan:,.0f}
-    - Факт продаж: {total_fact:,.0f} (Выполнение: {percent:.1f}%)
-    - Прогноз на конец месяца (расчетный): {forecast_val:,.0f}
-    - Структура продаж: {structure}
+    - План на месяц: {plan}
+    - Факт продаж: {total_fact} (Выполнение: {percent:.1f}%)
+    - Прогноз на конец месяца (расчетный): {forecast_val}
+    - Структура продаж: {structure_str}
     
     ТВОЯ ЗАДАЧА:
     Напиши отчет (Markdown).
     1. Оценка ситуации (Сравните прогноз с планом).
-    2. Проблемная з
+    2. Проблемная зона.
+    3. 3 конкретных совета.
+    """
+    
+    try:
+        client = Groq(api_key=api_key)
+        chat = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile"
+        )
+        return chat.choices[0].message.content
+    except Exception as e:
+        return f"Ошибка AI сервиса: {e}"
+
+# --- 4. ГЛАВНЫЙ ЭКРАН ---
+st.title("📊 SalesPro Analytics Dashboard")
+
+with st.sidebar:
+    st.header("Управление")
+    template_file = generate_template()
+    st.download_button(
+        label="📥 Скачать шаблон с инструкцией",
+        data=template_file,
+        file_name="sales_template_universal.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    st.divider()
+    uploaded_file = st.file_uploader("Загрузить отчет (.xlsx)", type="xlsx")
+
+if uploaded_file:
+    df, plans_map = load_data_and_plan(uploaded_file)
+    
+    if df is not None and not df.empty:
+        all_branches = sorted(df['Филиал'].unique())
+        selected_branch = st.sidebar.selectbox("Выберите объект/филиал", all_branches)
+        
+        df_branch = df[df['Филиал'] == selected_branch]
+        auto_plan = plans_map.get(selected_branch, 0)
+        
+        if auto_plan == 0:
+            st.warning(f"План не найден в файле. Введите вручную.")
+            target_plan = st.sidebar.number_input("План продаж", value=200000)
+        else:
+            st.sidebar.success(f"План подгружен: {auto_plan:,.0f}")
+            target_plan = auto_plan
+            
+        fact = df_branch['Продажи'].sum()
+        delta = fact - target_plan
+        percent = (fact / target_plan) * 100 if target_plan > 0 else 0
+        
+        # ИСПРАВЛЕННЫЙ РАСЧЕТ ПРОГНОЗА
+        forecast_val = calculate_forecast(df_branch)
+        forecast_delta = forecast_val - target_plan
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("🎯 План", f"{target_plan:,.0f}")
+        col2.metric("💰 Факт", f"{fact:,.0f}", f"{percent:.1f}%")
+        col3.metric("📉 Отклонение", f"{delta:,.0f}", delta_color="normal")
+        
+        col4.metric(
+            "🔮 Прогноз (конец мес.)", 
+            f"{forecast_val:,.0f}", 
+            f"{forecast_delta:,.0f}", 
+            delta_color="normal"
+        )
+
+        st.divider()
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.subheader("📆 Динамика")
+            df_trend = df_branch.groupby('Дата')['Продажи'].sum().reset_index()
+            fig_trend = px.area(df_trend, x='Дата', y='Продажи', color_discrete_sequence=['#00CC96'])
+            st.plotly_chart(fig_trend, use_container_width=True)
+        with c2:
+            st.subheader("📊 Категории")
+            df_pie = df_branch.groupby('Канал')['Продажи'].sum().reset_index()
+            fig_pie = px.pie(df_pie, values='Продажи', names='Канал', hole=0.5)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.divider()
+        if st.button("🧠 AI Бизнес-Ассистент", type="primary", use_container_width=True):
+            with st.spinner("Анализ данных..."):
+                report = get_ai_advice(selected_branch, target_plan, df_branch)
+                st.markdown(report)
+    else:
+        st.error("Ошибка формата. Скачайте шаблон слева.")
+else:
+    st.info("👈 Начните работу с загрузки файла.")
