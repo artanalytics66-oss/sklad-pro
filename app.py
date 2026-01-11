@@ -3,127 +3,148 @@ import pandas as pd
 import plotly.express as px
 from groq import Groq
 
-# --- НАСТРОЙКИ СТРАНИЦЫ ---
+# --- КОНФИГУРАЦИЯ ---
 st.set_page_config(page_title="SalesPro Analytics", layout="wide")
 
-# --- 1. СИСТЕМА ЛИЦЕНЗИРОВАНИЯ (ВХОД ПО КЛЮЧУ) ---
-def check_password():
-    """Возвращает True, если ключ верный."""
+# --- 1. АВТОРИЗАЦИЯ (Ключ продукта) ---
+def check_auth():
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
 
     if st.session_state["authenticated"]:
         return True
 
-    st.title("🔐 SalesPro Analytics Enterprise")
-    st.write("Для доступа к системе введите лицензионный ключ.")
-    
-    password = st.text_input("Ключ активации", type="password")
-    
-    if st.button("Войти"):
-        if password == "START-500":
-            st.session_state["authenticated"] = True
-            st.rerun()  # Перезагрузка страницы для входа
-        else:
-            st.error("⛔ Неверный ключ активации")
-            
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.title("🔐 SalesPro Analytics Enterprise")
+        st.write("Введите лицензионный ключ для доступа к системе.")
+        password = st.text_input("License Key", type="password")
+        if st.button("Войти в систему", type="primary", use_container_width=True):
+            if password == "START-500":
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("⛔ Неверный ключ активации")
     return False
 
-if not check_password():
-    st.stop()  # Останавливаем выполнение, если пароль не введен
+if not check_auth():
+    st.stop()
 
-# --- ОСНОВНОЕ ПРИЛОЖЕНИЕ (ЗАПУСКАЕТСЯ ПОСЛЕ ВХОДА) ---
-
-# --- ФУНКЦИИ ЗАГРУЗКИ ---
+# --- 2. ОБРАБОТКА ДАННЫХ (ФАКТ + ПЛАН) ---
 @st.cache_data
-def load_data(file):
-    """Загрузка факта и плана из Excel"""
+def load_data_and_plan(file):
+    """
+    Читает сложную горизонтальную структуру файла.
+    Возвращает DataFrame с фактом и словарь с планами.
+    """
     try:
-        # 1. Читаем ФАКТ (Лист1)
-        df_fact = pd.read_excel(file, sheet_name=0, header=None)
+        xl = pd.ExcelFile(file)
         
-        # Парсинг сложной шапки (как в прошлом коде)
-        row0 = df_fact.iloc[0].tolist()
-        row1 = df_fact.iloc[1].tolist()
+        # ------------------ ЧТЕНИЕ ФАКТА ------------------
+        # Ищем лист с фактом (обычно первый или с названием Лист1/Sheet1)
+        fact_sheet_name = xl.sheet_names[0] 
+        df_fact_raw = pd.read_excel(file, sheet_name=fact_sheet_name, header=None)
+        
+        # Парсинг факта (как делали раньше)
+        row0 = df_fact_raw.iloc[0].tolist() # Филиалы
+        row1 = df_fact_raw.iloc[1].tolist() # Каналы
+        
         branches = []
-        current_branch = "Unknown"
+        curr = "Unknown"
         for item in row0:
             if pd.notna(item) and "Филиал" in str(item):
-                current_branch = str(item).strip()
-            branches.append(current_branch)
+                curr = str(item).strip()
+            branches.append(curr)
             
-        cleaned_fact = []
-        for idx, row in df_fact.iloc[2:].iterrows():
+        fact_data = []
+        # Данные начинаются со строки 2 (индекс 2)
+        for idx, row in df_fact_raw.iloc[2:].iterrows():
             date_val = row[0]
             if pd.isna(date_val): continue
+            
+            # Проходим по колонкам начиная с 3-й (индекс 2)
             for col_idx in range(2, len(row)):
                 branch = branches[col_idx]
                 channel = row1[col_idx]
                 val = row[col_idx]
+                
                 if branch and channel in ['город', 'область', 'хорека']:
-                    cleaned_fact.append({
+                    fact_data.append({
                         'Дата': date_val,
                         'Филиал': branch,
-                        'Канал': channel.capitalize(),
+                        'Канал': str(channel).strip().capitalize(),
                         'Продажи': val if pd.notna(val) else 0
                     })
-        df_sales = pd.DataFrame(cleaned_fact)
+        df_sales = pd.DataFrame(fact_data)
 
-        # 2. Читаем ПЛАН (Ищем лист "План" или "Plan")
-        try:
-            # Пытаемся найти лист с названием 'План' или 'Plan'
-            xl_file = pd.ExcelFile(file)
-            sheet_names = xl_file.sheet_names
-            plan_sheet = next((s for s in sheet_names if 'лан' in s or 'lan' in s), None)
+        # ------------------ ЧТЕНИЕ ПЛАНА ------------------
+        plans_map = {}
+        # Ищем лист с названием "план" (регистронезависимо)
+        plan_sheet_name = next((s for s in xl.sheet_names if 'план' in s.lower() or 'plan' in s.lower()), None)
+        
+        if plan_sheet_name:
+            df_plan_raw = pd.read_excel(file, sheet_name=plan_sheet_name, header=None)
             
-            plans_dict = {}
-            if plan_sheet:
-                # Ожидаем структуру: Колонка А - Филиал, Колонка B - План
-                df_plan = pd.read_excel(file, sheet_name=plan_sheet)
-                # Ищем колонки, похожие на 'Филиал' и 'План'
-                # Для простоты берем 1-ю и 2-ю колонку, если заголовки не совпадают
-                plans_dict = dict(zip(df_plan.iloc[:, 0], df_plan.iloc[:, 1]))
+            # Структура такая же: стр 0 - Филиалы, стр 1 - Каналы, стр 2 - Значения
+            p_row0 = df_plan_raw.iloc[0].tolist()
+            p_row1 = df_plan_raw.iloc[1].tolist()
+            p_values = df_plan_raw.iloc[2].tolist() # Сами цифры плана
             
-        except Exception as e:
-            st.warning(f"Не удалось прочитать лист с планами: {e}. Используем стандартные.")
-            plans_dict = {}
+            p_branches = []
+            p_curr = "Unknown"
+            # Пропускаем первые 2 колонки (Месяц, Год)
+            for i in range(2, len(p_row0)):
+                item = p_row0[i]
+                if pd.notna(item) and "Филиал" in str(item):
+                    p_curr = str(item).strip()
+                p_branches.append(p_curr)
+                
+            # Собираем словарь планов
+            # Нам нужны индексы в p_values, которые соответствуют индексам в p_branches + смещение 2
+            # p_values уже полный список строки, так что индексы совпадают с p_branches + 2
+            
+            for i, branch in enumerate(p_branches):
+                real_idx = i + 2 # смещение из-за колонок Месяц/Год
+                if real_idx >= len(p_values): break
+                
+                val = p_values[real_idx]
+                channel = p_row1[real_idx]
+                
+                if pd.notna(val) and str(channel).lower().strip() == 'итого':
+                     plans_map[branch] = val
 
-        return df_sales, plans_dict
+        return df_sales, plans_map
 
     except Exception as e:
-        st.error(f"Ошибка чтения файла: {e}")
+        st.error(f"Ошибка обработки файла: {e}")
         return None, {}
 
 def get_ai_advice(branch, plan, fact_df):
-    """Генерация рекомендаций через Groq API"""
-    
-    # 2. ПОЛУЧЕНИЕ API KEY ИЗ СЕКРЕТОВ (для защиты)
+    """Запрос к AI с использованием секретного ключа"""
     try:
+        # Пытаемся взять ключ из Streamlit Cloud Secrets
         api_key = st.secrets["GROQ_API_KEY"]
     except:
-        return "⚠️ Ошибка: Ключ API не найден. Настройте 'GROQ_API_KEY' в настройках Streamlit Cloud."
+        # Для локального теста, если секретов нет
+        return "⚠️ ОШИБКА: Не настроен GROQ_API_KEY в Streamlit Secrets."
 
-    # Агрегация данных
     total_fact = fact_df['Продажи'].sum()
-    if plan > 0:
-        percent = (total_fact / plan) * 100
-    else:
-        percent = 0
-        
+    percent = (total_fact / plan * 100) if plan > 0 else 0
     structure = fact_df.groupby('Канал')['Продажи'].sum().to_dict()
     
     prompt = f"""
-    Роль: Бизнес-аналитик. Филиал: {branch}.
-    ДАННЫЕ:
-    - План: {plan:,.0f}
-    - Факт: {total_fact:,.0f} ({percent:.1f}%)
-    - Структура: {structure}
+    Роль: Старший бизнес-аналитик. Объект: {branch}.
+    ВХОДНЫЕ ДАННЫЕ:
+    - План на месяц: {plan:,.0f}
+    - Факт продаж: {total_fact:,.0f} (Выполнение: {percent:.1f}%)
+    - Структура по каналам: {structure}
     
-    ЗАДАЧА:
-    Краткий отчет (Markdown, русский язык):
-    1. Оценка ситуации (кратко).
-    2. Слабые места.
-    3. 3 шага для выполнения плана.
+    ТВОЯ ЗАДАЧА:
+    Напиши стратегический отчет в формате Markdown.
+    1. 🎯 Статус выполнения (Опасно/Норма/Отлично).
+    2. 📉 Проблемная зона (какой канал тянет вниз).
+    3. 🚀 3 конкретных действия для менеджера, чтобы закрыть план.
+    Будь краток и конкретен.
     """
     
     try:
@@ -134,57 +155,82 @@ def get_ai_advice(branch, plan, fact_df):
         )
         return chat.choices[0].message.content
     except Exception as e:
-        return f"Ошибка соединения с AI: {e}"
+        return f"Ошибка AI сервиса: {e}"
 
-# --- ИНТЕРФЕЙС ПРИЛОЖЕНИЯ ---
+# --- 3. ГЛАВНЫЙ ЭКРАН ---
 st.title("📊 SalesPro Analytics Dashboard")
+st.markdown("Система мониторинга и прогнозирования продаж")
 
 with st.sidebar:
-    st.header("Данные")
-    uploaded_file = st.file_uploader("Загрузить отчет (Excel)", type="xlsx")
-    
+    st.header("Управление")
+    uploaded_file = st.file_uploader("Загрузить отчет (.xlsx)", type="xlsx")
+    st.info("Файл должен содержать листы с фактом и планом.")
+
 if uploaded_file:
-    df, loaded_plans = load_data(uploaded_file)
+    df, plans_map = load_data_and_plan(uploaded_file)
     
-    if df is not None:
-        all_branches = df['Филиал'].unique()
+    if df is not None and not df.empty:
+        # Выбор филиала
+        all_branches = sorted(df['Филиал'].unique())
         selected_branch = st.sidebar.selectbox("Выберите филиал", all_branches)
         
-        # Получаем план из файла или берем дефолт
-        # Ищем точное совпадение названия филиала в загруженных планах
-        branch_plan = loaded_plans.get(selected_branch, 230000) 
-        
-        # Возможность скорректировать план вручную
-        target_plan = st.sidebar.number_input("План продаж (кг)", value=int(branch_plan), step=1000)
-        
+        # Получение данных филиала
         df_branch = df[df['Филиал'] == selected_branch]
         
-        # Метрики
-        fact_sales = df_branch['Продажи'].sum()
-        progress = (fact_sales / target_plan) * 100 if target_plan > 0 else 0
+        # Автоматическое получение плана
+        auto_plan = plans_map.get(selected_branch, 0)
         
-        col1, col2, col3 = st.columns(3)
-        col1.metric("🎯 План", f"{target_plan:,.0f}")
-        col2.metric("💰 Факт", f"{fact_sales:,.0f}", f"{progress:.1f}%")
-        col3.metric("📉 Прогноз", f"{fact_sales * 1.2:,.0f}") # Примерная логика
+        if auto_plan == 0:
+            st.warning(f"План для {selected_branch} не найден в файле. Введите вручную.")
+            target_plan = st.sidebar.number_input("План продаж", value=200000)
+        else:
+            st.sidebar.success(f"План подгружен: {auto_plan:,.0f}")
+            target_plan = auto_plan
+            
+        # KPI МЕТРИКИ
+        fact = df_branch['Продажи'].sum()
+        delta = fact - target_plan
+        percent = (fact / target_plan) * 100 if target_plan > 0 else 0
+        
+        # Стильные карточки
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("План на месяц", f"{target_plan:,.0f} кг")
+        col2.metric("Факт продаж", f"{fact:,.0f} кг", f"{percent:.1f}%")
+        col3.metric("Отклонение", f"{delta:,.0f} кг", delta_color="normal")
+        col4.metric("Прогноз (Линейный)", f"{fact * 1.25:,.0f} кг") # Простая экстраполяция
 
-        # Графики
+        # ГРАФИКИ
+        st.divider()
         c1, c2 = st.columns([2, 1])
+        
         with c1:
-            st.subheader("Динамика")
+            st.subheader("📆 Динамика продаж")
             df_trend = df_branch.groupby('Дата')['Продажи'].sum().reset_index()
-            st.plotly_chart(px.area(df_trend, x='Дата', y='Продажи'), use_container_width=True)
+            fig_trend = px.area(df_trend, x='Дата', y='Продажи', color_discrete_sequence=['#00CC96'])
+            st.plotly_chart(fig_trend, use_container_width=True)
             
         with c2:
-            st.subheader("Каналы")
+            st.subheader("📊 Структура каналов")
             df_pie = df_branch.groupby('Канал')['Продажи'].sum().reset_index()
-            st.plotly_chart(px.pie(df_pie, values='Продажи', names='Канал'), use_container_width=True)
+            fig_pie = px.pie(df_pie, values='Продажи', names='Канал', hole=0.5)
+            st.plotly_chart(fig_pie, use_container_width=True)
 
-        # AI Аналитик
+        # AI БЛОК
         st.divider()
-        if st.button("🧠 AI Рекомендации", type="primary"):
-            with st.spinner("Анализирую данные..."):
-                advice = get_ai_advice(selected_branch, target_plan, df_branch)
-                st.markdown(advice)
+        st.subheader("🧠 Интеллектуальный помощник")
+        
+        col_ai_btn, col_ai_res = st.columns([1, 3])
+        with col_ai_btn:
+            if st.button("Запросить анализ AI", type="primary", use_container_width=True):
+                with st.spinner("Генерация стратегии..."):
+                    report = get_ai_advice(selected_branch, target_plan, df_branch)
+                    st.session_state['ai_report'] = report
+        
+        with col_ai_res:
+            if 'ai_report' in st.session_state:
+                st.markdown(st.session_state['ai_report'])
+                
+    else:
+        st.error("Не удалось прочитать данные. Проверьте формат файла.")
 else:
-    st.info("👋 Добро пожаловать! Загрузите Excel файл для начала работы.")
+    st.info("👈 Загрузите файл Excel в меню слева.")
